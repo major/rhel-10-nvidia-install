@@ -1,0 +1,89 @@
+#cloud-config
+# Bootstrap for RHEL 10 + NVIDIA driver install via rhel-drivers.
+# Stage 1 (this boot): write playbooks, install ansible-core, and run install.yml.
+# Stage 2 runs on the next boot via nvidia-verify.service. When
+# auto_reboot is true (default), cloud-init's power_state module fires the
+# reboot after cloud-final.service exits cleanly and stage1.ok exists.
+
+hostname: ${hostname}
+manage_etc_hosts: true
+
+package_update: true
+package_upgrade: false
+packages:
+  - ansible-core
+
+write_files:
+  - path: /opt/rhel-nvidia/ansible/install.yml
+    permissions: "0644"
+    content: |
+      ${indent(6, install_playbook)}
+
+  - path: /opt/rhel-nvidia/ansible/verify.yml
+    permissions: "0644"
+    content: |
+      ${indent(6, verify_playbook)}
+
+  - path: /opt/rhel-nvidia/ansible/files/vector_add.cu
+    permissions: "0644"
+    content: |
+      ${indent(6, vector_add_src)}
+
+  - path: /etc/systemd/system/nvidia-verify.service
+    permissions: "0644"
+    content: |
+      ${indent(6, verify_service)}
+
+  - path: /usr/local/bin/rhel-nvidia-status
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # Convenience helper to inspect install + verify state.
+      set -euo pipefail
+      echo "=== state dir ==="
+      ls -la /var/lib/rhel-nvidia/ 2>/dev/null || echo "(missing)"
+      echo
+      echo "=== status ==="
+      cat /var/lib/rhel-nvidia/status 2>/dev/null || echo "(not written yet)"
+      echo
+      if [ -f /var/lib/rhel-nvidia/stage1.ok ] && [ ! -f /var/lib/rhel-nvidia/status ]; then
+        echo "Stage 1 finished. Stage 2 runs on the next boot."
+        echo "(auto-reboot enabled => reboot is imminent; otherwise: sudo reboot)"
+        echo
+      fi
+      echo "=== verify service journal tail ==="
+      journalctl -u nvidia-verify.service --no-pager -n 40 2>/dev/null || true
+
+runcmd:
+  - [mkdir, -p, /var/lib/rhel-nvidia]
+  # Need to pre-link the CUDA source where verify.yml expects it.
+  - [cp, /opt/rhel-nvidia/ansible/files/vector_add.cu, /var/lib/rhel-nvidia/vector_add.cu]
+  - [systemctl, daemon-reload]
+  # Stage 1: install. On success, ansible writes /var/lib/rhel-nvidia/stage1.ok,
+  # which arms the power_state reboot below. On failure, cloud-init reports an
+  # error and the reboot condition fails (stage1.ok is absent) so the instance
+  # stays up for debugging.
+  - >-
+    /bin/sh -c '
+    /usr/bin/ansible-playbook
+    -i localhost,
+    -c local
+    /opt/rhel-nvidia/ansible/install.yml
+    '
+
+%{ if auto_reboot ~}
+# Runs as cc_power_state_change in cloud_final_modules: cloud-init waits for
+# cloud-final.service to exit cleanly before invoking `shutdown -r`. The
+# condition gates the reboot on a successful stage 1 (stage1.ok marker),
+# so a failed install leaves the instance up for inspection.
+# Cloud-init's per-instance semaphores prevent this module from running on
+# subsequent boots of the same instance, so there is no reboot loop.
+power_state:
+  delay: now
+  mode: reboot
+  message: rhel-nvidia stage 1 complete, rebooting for stage 2 verification.
+  timeout: 30
+  condition: test -f /var/lib/rhel-nvidia/stage1.ok
+%{ endif ~}
+
+final_message: "rhel-nvidia cloud-init stage 1 finished."

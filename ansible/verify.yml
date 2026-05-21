@@ -1,0 +1,86 @@
+---
+# Stage 2: verify the NVIDIA driver and CUDA toolkit after manual reboot.
+# Invoked by nvidia-verify.service on the boot after stage 1 completes.
+
+- name: Verify NVIDIA driver and CUDA toolkit
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  vars:
+    state_dir: /var/lib/rhel-nvidia
+    sample_src: /var/lib/rhel-nvidia/vector_add.cu
+    sample_bin: /var/lib/rhel-nvidia/vector_add
+    status_file: /var/lib/rhel-nvidia/status
+    # CUDA toolkit installs under /usr/local/cuda-<ver>/ and exposes a stable
+    # /usr/local/cuda symlink via the alternatives system. nvcc is not in $PATH
+    # by default, so we invoke it by full path.
+    nvcc_bin: /usr/local/cuda/bin/nvcc
+
+  tasks:
+    - name: Record stage-2 start
+      ansible.builtin.copy:
+        dest: "{{ state_dir }}/stage2.started"
+        content: "{{ ansible_date_time.iso8601 }}\n"
+        mode: "0644"
+
+    - name: Confirm nvidia kernel module is loaded
+      ansible.builtin.command: lsmod
+      register: lsmod_out
+      changed_when: false
+      failed_when: "'nvidia' not in lsmod_out.stdout"
+
+    - name: Run nvidia-smi
+      ansible.builtin.command: nvidia-smi
+      register: nvidia_smi
+      changed_when: false
+
+    - name: Save nvidia-smi output
+      ansible.builtin.copy:
+        dest: "{{ state_dir }}/nvidia-smi.txt"
+        content: "{{ nvidia_smi.stdout }}\n"
+        mode: "0644"
+
+    - name: Verify nvcc is present
+      ansible.builtin.stat:
+        path: "{{ nvcc_bin }}"
+      register: nvcc_stat
+      failed_when: not nvcc_stat.stat.exists
+
+    - name: Compile CUDA vector_add sample
+      ansible.builtin.command:
+        cmd: "{{ nvcc_bin }} -O2 -o {{ sample_bin }} {{ sample_src }}"
+      register: nvcc_compile
+      changed_when: true
+
+    - name: Run CUDA vector_add sample
+      ansible.builtin.command: "{{ sample_bin }}"
+      register: vector_add_run
+      changed_when: false
+      failed_when:
+        - vector_add_run.rc != 0
+        - "'PASS' not in vector_add_run.stdout"
+
+    - name: Save CUDA sample output
+      ansible.builtin.copy:
+        dest: "{{ state_dir }}/vector_add.out"
+        content: "{{ vector_add_run.stdout }}\n"
+        mode: "0644"
+
+    - name: Write final status file (OK)
+      ansible.builtin.copy:
+        dest: "{{ status_file }}"
+        content: |
+          status: OK
+          completed: {{ ansible_date_time.iso8601 }}
+          kernel: {{ ansible_facts['kernel'] }}
+        mode: "0644"
+
+  post_tasks:
+    - name: Disable nvidia-verify.service after success
+      ansible.builtin.systemd:
+        name: nvidia-verify.service
+        enabled: false
+
+  handlers: []

@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars and edit if you want to override defaults.
+
+# region        = "us-east-2"
+# instance_type = "g6.xlarge"
+
+# AWS profile from ~/.aws/credentials (default is "lightspeed").
+# Set to "" to use ambient credentials (env vars, SSO default, etc.).
+# aws_profile = "lightspeed"
+
+# Lock SSH down to your IP/CIDR. Example for a single IP:
+# allowed_ssh_cidrs = ["203.0.113.10/32"]
+
+# Override the SSH key (the default is the one you supplied):
+# ssh_public_key = "ssh-ed25519 AAAA... user@host"
+
+# tags = {
+#   Owner = "you"
+#   Cost  = "rhel-nvidia-test"
+# }

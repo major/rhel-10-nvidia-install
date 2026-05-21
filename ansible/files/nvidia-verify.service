@@ -1,0 +1,15 @@
+[Unit]
+Description=Verify NVIDIA driver and CUDA toolkit (rhel-10-nvidia-install)
+Documentation=https://www.redhat.com/en/blog/introducing-new-and-simplified-ai-accelerator-driver-experience-rhel
+After=multi-user.target network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/rhel-nvidia/status
+
+[Service]
+Type=oneshot
+RemainAfterExit=false
+WorkingDirectory=/opt/rhel-nvidia/ansible
+ExecStart=/usr/bin/ansible-playbook -i localhost, -c local /opt/rhel-nvidia/ansible/verify.yml
+
+[Install]
+WantedBy=multi-user.target

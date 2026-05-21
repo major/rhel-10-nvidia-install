@@ -1,0 +1,153 @@
+---
+# Stage 1: install rhel-drivers and NVIDIA driver/CUDA toolkit.
+# Runs from cloud-init on first boot via ansible-playbook against localhost.
+# Reboot is manual while stage transitions are under test. On the next boot,
+# the systemd unit nvidia-verify.service runs verify.yml.
+
+- name: Install NVIDIA drivers on RHEL 10
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  vars:
+    state_dir: /var/lib/rhel-nvidia
+
+  pre_tasks:
+    - name: Ensure state directory exists
+      ansible.builtin.file:
+        path: "{{ state_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Record stage-1 start
+      ansible.builtin.copy:
+        dest: "{{ state_dir }}/stage1.started"
+        content: "{{ ansible_date_time.iso8601 }}\n"
+        mode: "0644"
+
+    - name: Fail fast if not RHEL 10
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'RedHat'
+          - ansible_facts['distribution_major_version'] | int == 10
+        fail_msg: >-
+          This playbook targets RHEL 10. Detected
+          {{ ansible_facts['distribution'] }}
+          {{ ansible_facts['distribution_version'] }}.
+
+  tasks:
+    # Speed up the ~5.9 GB rhel-drivers transaction. cloud-init's
+    # package_update: true already refreshed dnf metadata earlier in first
+    # boot, so a separate `dnf makecache` task here would be redundant.
+    # ini_file would be cleaner here, but it lives in community.general
+    # which ansible-core does NOT ship. blockinfile is in ansible.builtin.
+    - name: Tune dnf for parallel downloads
+      ansible.builtin.blockinfile:
+        path: /etc/dnf/dnf.conf
+        insertafter: '^\[main\]'
+        marker: "# {mark} rhel-nvidia dnf tuning"
+        block: |
+          max_parallel_downloads=20
+          fastestmirror=1
+
+    # rhel-drivers needs the Extensions repo (kmod-nvidia) and Supplementary
+    # repo (nvidia-driver, cuda-toolkit). On PAYG RHEL via RHUI, these ship
+    # as rhel-10-extensions-rhui-rpms and rhel-10-supplementary-rhui-rpms,
+    # disabled by default. rhel-drivers' internal "enable channels" logic
+    # only knows the CDN repo IDs and goes through subscription-manager,
+    # which doesn't manage repos on PAYG. So we enable the RHUI variants
+    # ourselves before installing rhel-drivers itself, so the very first
+    # dnf transaction below already sees them. On a BYOS AMI these repo IDs
+    # don't exist (subscription-manager + the CDN repos are the right path
+    # there), so we conditional on the repos being present.
+    #
+    # `dnf config-manager` is not guaranteed on a fresh RHEL 10 PAYG image;
+    # it's provided by python3-dnf-plugins-core (capability:
+    # dnf-command(config-manager)). Install the capability explicitly so we
+    # never have to depend on radii/rhel-drivers pulling it in transitively.
+    - name: Ensure dnf config-manager subcommand is available
+      ansible.builtin.dnf:
+        name: dnf-command(config-manager)
+        state: present
+
+    - name: List available dnf repositories
+      ansible.builtin.command: dnf -q repolist --all
+      register: repolist_all
+      changed_when: false
+
+    - name: Enable RHUI Extensions + Supplementary repos (PAYG)
+      ansible.builtin.command:
+        cmd: >-
+          dnf config-manager --enable
+          rhel-10-extensions-rhui-rpms
+          rhel-10-supplementary-rhui-rpms
+      when: "'rhel-10-extensions-rhui-rpms' in repolist_all.stdout"
+      changed_when: true
+
+    - name: Install rhel-drivers from AppStream
+      ansible.builtin.dnf:
+        name: rhel-drivers
+        state: present
+
+    - name: Detect installed NVIDIA driver before running rhel-drivers
+      ansible.builtin.command: rpm -q --whatprovides nvidia-driver
+      register: nvidia_pre
+      changed_when: false
+      failed_when: false
+
+    - name: Run rhel-drivers install (auto-detect, non-interactive)
+      ansible.builtin.command: rhel-drivers install --auto-detect --batch
+      register: rhel_drivers_run
+      changed_when: nvidia_pre.rc != 0
+      # --auto-detect picks the latest signed NVIDIA driver matching the
+      # detected GPU and running kernel (rhel-drivers requires an explicit
+      # selector; bare 'nvidia' is rejected). --batch suppresses prompts.
+      # Pulls kmod-nvidia-open + nvidia-driver + cuda-toolkit from the
+      # Extensions/Supplementary repos enabled above.
+
+    - name: Record rhel-drivers output
+      ansible.builtin.copy:
+        dest: "{{ state_dir }}/rhel-drivers-install.log"
+        content: |
+          stdout:
+          {{ rhel_drivers_run.stdout | default('') }}
+
+          stderr:
+          {{ rhel_drivers_run.stderr | default('') }}
+        mode: "0644"
+
+    # The kernel-tracked kmod ships as `kmod-nvidia-open-<ver>-<kver>` and does
+    # not always carry a `Provides: kmod-nvidia` (it's version-dependent). Match
+    # the family with `rpm -qa` instead.
+    - name: Verify kmod-nvidia* package is installed
+      ansible.builtin.shell:
+        cmd: rpm -qa 'kmod-nvidia*' | grep -E '^kmod-nvidia' || exit 1
+      register: kmod_check
+      changed_when: false
+
+    - name: Verify nvidia-driver and cuda-toolkit are installed
+      ansible.builtin.command: >-
+        rpm -q --whatprovides nvidia-driver cuda-toolkit
+      register: rpm_check
+      changed_when: false
+
+    # nvidia-persistenced will start after reboot once the kmod is loaded.
+    - name: Enable nvidia-persistenced service
+      ansible.builtin.systemd:
+        name: nvidia-persistenced
+        enabled: true
+
+    - name: Enable nvidia-verify.service for next-boot verification
+      ansible.builtin.systemd:
+        name: nvidia-verify.service
+        enabled: true
+
+    - name: Record stage-1 success
+      ansible.builtin.copy:
+        dest: "{{ state_dir }}/stage1.ok"
+        content: |
+          completed: {{ ansible_date_time.iso8601 }}
+          kernel: {{ ansible_facts['kernel'] }}
+          packages: {{ rpm_check.stdout_lines }}
+        mode: "0644"
